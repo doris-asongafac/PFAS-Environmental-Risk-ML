@@ -1,0 +1,801 @@
+---
+title: "Models"
+author: "Doris Mbitazi Asongafac"
+date: "2025-07-14"
+output: html_document
+---
+
+
+```{r}
+# Load required libraries
+library(randomForest)
+library(caret)
+library(ggplot2)
+library(dplyr)
+library(xgboost)
+library(pROC) 
+library(corrplot)
+library(dplyr)
+library(car)
+```
+
+
+```{r}
+# Load the final dataset
+df <- read.csv("final_data_clean.csv")
+
+#Check missing values
+sum(is.na(df))
+
+#Structure of the data
+str(df)
+```
+
+```{r}
+# Convert incorrect data types to correct data types
+df$pfoa_detected <- as.factor(df$pfoa_detected)
+df$state <- as.factor(df$state)
+df$water_use <- as.factor(df$water_use)
+df$tritium_category <- as.factor(df$tritium_category)
+df$month <- as.factor(df$month)
+df$median_income <- as.numeric(df$median_income)
+
+# Filter states with at less than 5 observations
+state_counts <- df %>% 
+  count(state) %>% 
+  filter(n >= 5)
+
+df <- df %>% 
+  filter(state %in% state_counts$state)
+
+cat("States included:", paste(sort(state_counts$state), collapse = ", "), "\n\n")
+
+# Double-check structure
+str(df)
+
+```
+
+```{r}
+#Inspecting the raw data (already done with str(df))
+# Also use:
+summary(df) 
+skimr::skim(df) 
+
+```
+
+```{r}
+# Select only numeric variables for correlation matrix
+numeric_vars <- names(df)[sapply(df, is.numeric)]
+
+print("Numeric variables identified:")
+print(numeric_vars)
+
+# Create correlation matrix for numeric variables
+# Using base R method for compatibility
+correlation_data <- df[, numeric_vars]
+correlation_data <- correlation_data[complete.cases(correlation_data), ]
+
+# Calculate correlation matrix
+cor_matrix <- cor(correlation_data, use = "complete.obs")
+
+print("Correlation matrix dimensions:")
+print(dim(cor_matrix))
+```
+
+```{r}
+corrplot(cor_matrix, 
+         method = "color",
+         type = "upper",
+         order = "hclust",
+         addCoef.col = "black",
+         number.cex = 0.6,
+         tl.cex = 0.8,
+         tl.col = "black",
+         tl.srt = 45,
+         title = "Correlation Matrix with Values",
+         mar = c(0,0,2,0))
+
+```
+
+
+```{r}
+# Find highly correlated pairs (absolute correlation > 0.7)
+high_cor_threshold <- 0.7
+
+# Get upper triangle of correlation matrix
+upper_tri <- upper.tri(cor_matrix)
+cor_matrix_upper <- cor_matrix
+cor_matrix_upper[!upper_tri] <- NA
+
+# Convert to data frame and find high correlations
+high_correlations <- which(abs(cor_matrix_upper) > high_cor_threshold, arr.ind = TRUE)
+
+if(nrow(high_correlations) > 0) {
+  high_cor_pairs <- data.frame(
+    Variable1 = rownames(cor_matrix)[high_correlations[,1]],
+    Variable2 = colnames(cor_matrix)[high_correlations[,2]],
+    Correlation = cor_matrix_upper[high_correlations]
+  ) %>%
+    arrange(desc(abs(Correlation)))
+  
+  print(high_cor_pairs)
+} else {
+  print(paste("No variable pairs found with |correlation| >", high_cor_threshold))
+}
+
+```
+
+
+
+```{r}
+#Log transformation of continuous response variable
+#Because its highly right skewed
+df$log_pfoa <- log(df$pfoa_val + 1)
+
+#Verify the change
+str(df)
+```
+
+#Linear regression model
+```{r}
+model <- lm(log_pfoa ~ .-longitude-latitude-median_income-pfoa_detected-pfoa_val-poverty_rate-pct_older-pct_hispanic-unemployment_rate-tritium_category, data=df)
+stepwise=step(model,  direction='both')
+summary(stepwise)
+```
+
+
+```{r}
+vif(stepwise)
+```
+
+
+```{r}
+model2 = lm(log_pfoa ~ state + tritium_tu + month + pct_white, data = df)
+summary(model2)
+```
+
+
+```{r}
+vif(model2)
+```
+#XGBoost Model
+```{r}
+library(xgboost)
+library(caret)
+
+# Select key predictors based on Random Forest importance and domain knowledge
+selected_vars <- c("well_depth", "tritium_tu", "month", "pct_adults", 
+                   "pct_older", "water_use", "pct_children", "cancer_rate",
+                   "pop_density_per_sq_mile", "pct_bachelor_plus", "state",
+                   "median_income", "pct_black", "pct_white", "pct_hispanic",
+                   "unemployment_rate", "poverty_rate")
+
+# Create modeling dataset
+model_data <- df[, c(selected_vars, "pfoa_detected")]
+
+# Convert factors to numeric for XGBoost
+model_data$month <- as.numeric(model_data$month)
+model_data$water_use <- as.numeric(model_data$water_use)
+model_data$state <- as.numeric(model_data$state)
+model_data$pfoa_detected <- as.numeric(model_data$pfoa_detected) - 1  # Convert to 0/1
+
+# Split data
+set.seed(123)
+train_index <- createDataPartition(model_data$pfoa_detected, p = 0.8, list = FALSE)
+train_data <- model_data[train_index, ]
+test_data <- model_data[-train_index, ]
+
+# Prepare matrices for XGBoost
+train_x <- as.matrix(train_data[, -ncol(train_data)])
+train_y <- train_data$pfoa_detected
+test_x <- as.matrix(test_data[, -ncol(test_data)])
+test_y <- test_data$pfoa_detected
+
+# Train XGBoost model
+xgb_model <- xgboost(
+  data = train_x,
+  label = train_y,
+  objective = "binary:logistic",
+  nrounds = 100,
+  max_depth = 6,
+  eta = 0.1,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  verbose = 0
+)
+
+# Get feature importance
+importance_matrix <- xgb.importance(colnames(train_x), model = xgb_model)
+print(importance_matrix)
+
+# Plot feature importance
+xgb.plot.importance(importance_matrix, top_n = 15)
+
+# Make predictions and evaluate
+predictions <- predict(xgb_model, test_x)
+pred_binary <- ifelse(predictions > 0.5, 1, 0)
+
+# Confusion matrix
+conf_matrix <- table(Predicted = pred_binary, Actual = test_y)
+print(conf_matrix)
+
+# Accuracy
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+cat("Accuracy:", round(accuracy, 4), "\n")
+```
+
+```{r}
+library(xgboost)
+library(caret)
+library(pROC)
+
+# [Your existing data preparation code...]
+
+# Make predictions (probabilities)
+predictions_prob <- predict(xgb_model, test_x)
+pred_binary <- ifelse(predictions_prob > 0.5, 1, 0)
+
+# Detailed Performance Metrics
+conf_matrix <- confusionMatrix(as.factor(pred_binary), as.factor(test_y), positive = "1")
+print(conf_matrix)
+
+# Manual calculation if needed
+sensitivity <- conf_matrix$table[2,2] / (conf_matrix$table[2,2] + conf_matrix$table[1,2])
+specificity <- conf_matrix$table[1,1] / (conf_matrix$table[1,1] + conf_matrix$table[2,1])
+f1_score <- 2 * (conf_matrix$byClass["Pos Pred Value"] * sensitivity) / 
+            (conf_matrix$byClass["Pos Pred Value"] + sensitivity)
+
+cat("Sensitivity:", round(sensitivity, 4), "\n")
+cat("Specificity:", round(specificity, 4), "\n")
+cat("F1-Score:", round(f1_score, 4), "\n")
+
+# AUC-ROC
+roc_curve <- roc(test_y, predictions_prob)
+auc_score <- auc(roc_curve)
+cat("AUC:", round(auc_score, 4), "\n")
+```
+```{r}
+# SHAP values for direction interpretation
+library(SHAPforxgboost)
+
+# Calculate SHAP values
+shap_values <- shap.values(xgb_model = xgb_model, X_train = train_x)
+shap_long <- shap.prep(xgb_model = xgb_model, X_train = train_x)
+
+# Summary plot showing positive/negative effects
+shap.plot.summary(shap_long)
+
+# Individual variable effects
+shap.plot.dependence(data_long = shap_long, x = "tritium_tu", y = "tritium_tu", color_feature = "well_depth")
+```
+
+```{r}
+library(caret)
+library(pROC)
+
+# Select key predictors (same as before)
+selected_vars <- c("well_depth", "tritium_tu", "month", "pct_adults", 
+                   "pct_older", "water_use", "pct_children", "cancer_rate",
+                   "pop_density_per_sq_mile", "pct_bachelor_plus", "state",
+                   "median_income", "pct_black", "pct_white", "pct_hispanic",
+                   "unemployment_rate", "poverty_rate")
+
+# Create modeling dataset
+model_data <- df[, c(selected_vars, "pfoa_detected")]
+
+# Split data
+set.seed(123)
+train_index <- createDataPartition(model_data$pfoa_detected, p = 0.8, list = FALSE)
+train_data <- model_data[train_index, ]
+test_data <- model_data[-train_index, ]
+
+# Fit logistic regression model
+logit_model <- glm(pfoa_detected ~ ., 
+                   data = train_data, 
+                   family = binomial(link = "logit"))
+
+# Model summary with coefficients and p-values
+summary(logit_model)
+
+# Make predictions
+predictions_prob <- predict(logit_model, test_data, type = "response")
+pred_binary <- ifelse(predictions_prob > 0.5, 1, 0)
+
+# Detailed Performance Metrics
+conf_matrix <- confusionMatrix(as.factor(pred_binary), 
+                              as.factor(test_data$pfoa_detected), 
+                              positive = "1")
+print(conf_matrix)
+
+# AUC-ROC
+roc_curve <- roc(test_data$pfoa_detected, predictions_prob)
+auc_score <- auc(roc_curve)
+cat("AUC:", round(auc_score, 4), "\n")
+
+# Plot ROC curve
+plot(roc_curve, main = "ROC Curve for Logistic Regression")
+
+# Extract significant variables (p < 0.05)
+coefficients_df <- data.frame(
+  Variable = names(coef(logit_model)),
+  Coefficient = coef(logit_model),
+  P_value = summary(logit_model)$coefficients[,4],
+  Significant = summary(logit_model)$coefficients[,4] < 0.05
+)
+
+# Show significant predictors
+significant_vars <- coefficients_df[coefficients_df$Significant == TRUE, ]
+print("Significant Predictors:")
+print(significant_vars)
+
+# Odds ratios for interpretation
+odds_ratios <- exp(coef(logit_model))
+print("Odds Ratios:")
+print(odds_ratios)
+```
+
+```{r}
+library(caret)
+library(pROC)
+
+# Select key predictors (same as before)
+selected_vars <- c("well_depth", "tritium_tu", "month", "pct_adults", 
+                   "pct_older", "water_use", "pct_children", "cancer_rate",
+                   "pop_density_per_sq_mile", "pct_bachelor_plus", "state",
+                   "median_income", "pct_black", "pct_white", "pct_hispanic",
+                   "unemployment_rate", "poverty_rate")
+
+# Create modeling dataset
+model_data <- df[, c(selected_vars, "pfoa_detected")]
+
+# Check for separation issues
+table(model_data$pfoa_detected, model_data$state)  # Check state distribution
+table(model_data$pfoa_detected, model_data$month)  # Check month distribution
+table(model_data$pfoa_detected, model_data$water_use)  # Check water_use distribution
+
+# Remove problematic variables or combine levels
+# Option 1: Remove state (likely causing separation)
+model_data_fixed <- model_data[, !names(model_data) %in% c("state")]
+
+# Option 2: Use regularized logistic regression instead
+library(glmnet)
+
+# Split data
+set.seed(123)
+train_index <- createDataPartition(model_data_fixed$pfoa_detected, p = 0.8, list = FALSE)
+train_data <- model_data_fixed[train_index, ]
+test_data <- model_data_fixed[-train_index, ]
+
+# Prepare matrix for glmnet (handles factors automatically)
+train_x <- model.matrix(pfoa_detected ~ ., data = train_data)[,-1]  # Remove intercept
+train_y <- as.numeric(train_data$pfoa_detected) - 1  # Convert to 0/1
+test_x <- model.matrix(pfoa_detected ~ ., data = test_data)[,-1]
+test_y <- as.numeric(test_data$pfoa_detected) - 1
+
+# Fit regularized logistic regression (Ridge/Lasso)
+cv_model <- cv.glmnet(train_x, train_y, family = "binomial", alpha = 0.5)  # Elastic net
+best_lambda <- cv_model$lambda.min
+
+# Final model
+logit_model <- glmnet(train_x, train_y, family = "binomial", 
+                     alpha = 0.5, lambda = best_lambda)
+
+# Coefficients
+coefficients <- coef(logit_model)
+print("Model Coefficients:")
+print(coefficients)
+
+# Make predictions
+predictions_prob <- predict(logit_model, test_x, type = "response")
+pred_binary <- ifelse(predictions_prob > 0.5, 1, 0)
+
+# Performance metrics
+conf_matrix <- confusionMatrix(as.factor(pred_binary), 
+                              as.factor(test_y), 
+                              positive = "1")
+print(conf_matrix)
+
+# AUC
+roc_curve <- roc(test_y, as.numeric(predictions_prob))
+auc_score <- auc(roc_curve)
+cat("AUC:", round(auc_score, 4), "\n")
+```
+
+
+```{r}
+# Check the distribution of the response variable
+table(df$pfoa_detected)
+```
+
+
+```{r}
+# Split data into training and testing sets (70/30 split)
+train_index <- createDataPartition(df$pfoa_detected, p = 0.7, list = FALSE)
+train_data <- df[train_index, ]
+test_data <- df[-train_index, ]
+
+# Prepare predictor variables (exclude pfoa_detected and pfoa_val )
+all_vars <- names(df)
+exclude_vars <- c("pfoa_detected", "pfoa_val", "log_pfoa", "longitude", "latitude", "tritium_category")
+predictors <- setdiff(all_vars, exclude_vars)
+print(predictors)
+
+# Check the distribution of the response variable
+print(table(df$pfoa_detected))
+```
+
+
+```{r}
+# RANDOM FOREST MODEL
+rf <- as.formula(paste("pfoa_detected ~", paste(predictors, collapse = " + ")))
+
+# Train Random Forest model
+rf_model <- randomForest(
+  rf,
+  data = train_data,
+  ntree = 500,
+  mtry = floor(sqrt(length(predictors))),
+  importance = TRUE,
+  na.action = na.omit
+)
+
+# Print Random Forest results
+print(rf_model)
+```
+
+```{r}
+# Make predictions on test set
+rf_predictions <- predict(rf_model, test_data)
+rf_confusion <- confusionMatrix(rf_predictions, test_data$pfoa_detected)
+print(rf_confusion)
+
+```
+
+```{r}
+# Variable Importance Plot
+
+importance_df <- data.frame(
+  Variable = rownames(importance(rf_model)),
+  MeanDecreaseAccuracy = importance(rf_model)[, "MeanDecreaseAccuracy"],
+  MeanDecreaseGini = importance(rf_model)[, "MeanDecreaseGini"]
+)
+
+# Create importance plot
+importance_plot <- ggplot(importance_df, aes(x = reorder(Variable, MeanDecreaseAccuracy), 
+                                           y = MeanDecreaseAccuracy)) +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  coord_flip() +
+  labs(title = "Random Forest Variable Importance",
+       subtitle = "Based on Mean Decrease in Accuracy",
+       x = "Variables",
+       y = "Mean Decrease in Accuracy") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+print(importance_plot)
+```
+
+```{r}
+# Print top 10 most important variables
+top_vars <- importance_df[order(importance_df$MeanDecreaseAccuracy, decreasing = TRUE), ][1:10, ]
+print(top_vars)
+```
+#balanced data
+```{r}
+library(ROSE)
+balanced_data <- ROSE(pfoa_detected ~ ., data = df, seed = 123)$data
+table(df$pfoa_detected)               # Before
+table(balanced_data$pfoa_detected)    # After
+
+# Split data into training and testing sets (70/30 split)
+train_index <- createDataPartition(balanced_data$pfoa_detected, p = 0.7, list = FALSE)
+train_data <- balanced_data[train_index, ]
+test_data <- balanced_data[-train_index, ]
+
+# Prepare predictor variables (exclude pfoa_detected and pfoa_val )
+all_vars <- names(df)
+exclude_vars <- c("pfoa_detected", "pfoa_val", "log_pfoa", "longitude", "latitude", "tritium_category")
+predictors <- setdiff(all_vars, exclude_vars)
+print(predictors)
+
+```
+
+
+```{r}
+rf <- as.formula(paste("pfoa_detected ~", paste(predictors, collapse = " + ")))
+
+# Train Random Forest model
+r_model <- randomForest(
+  rf,
+  data = train_data,
+  ntree = 500,
+  mtry = floor(sqrt(length(predictors))),
+  importance = TRUE,
+  na.action = na.omit
+)
+
+# Print Random Forest results
+print(r_model)
+
+# Make predictions on test set
+r_predictions <- predict(r_model, test_data)
+confusion <- confusionMatrix(r_predictions, test_data$pfoa_detected)
+print(confusion)
+```
+
+```{r}
+# Variable Importance Plot
+
+importance_d <- data.frame(
+  Variable = rownames(importance(r_model)),
+  MeanDecreaseAccuracy = importance(r_model)[, "MeanDecreaseAccuracy"],
+  MeanDecreaseGini = importance(r_model)[, "MeanDecreaseGini"]
+)
+
+# Create importance plot
+importance <- ggplot(importance_df, aes(x = reorder(Variable, MeanDecreaseAccuracy), 
+                                           y = MeanDecreaseAccuracy)) +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  coord_flip() +
+  labs(title = "Random Forest Variable Importance",
+       subtitle = "Based on Mean Decrease in Accuracy",
+       x = "Variables",
+       y = "Mean Decrease in Accuracy") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+print(importance)
+```
+
+```{r}
+# Print top 10 most important variables
+top <- importance_d[order(importance_d$MeanDecreaseAccuracy, decreasing = TRUE), ][1:10, ]
+print(top)
+```
+
+
+#AutoML for log_pfoa (Regression Task)
+```{r}
+# Load the h2o library
+library(h2o)
+
+# Start H2O 
+h2o.init()
+
+# Convert your dataframe to an H2OFrame
+df_h2o <- as.h2o(df)
+
+# Define response and predictors - REMOVING specified variables (using log_pfoa as response)
+variables_to_remove <- c("latitude", "longitude", "tritium_category", "pfoa_val", "pfoa_detected", "log_pfoa")
+x_reg <- setdiff(names(df), variables_to_remove)  # Remove specified vars AND response from predictors
+y_reg <- "log_pfoa"
+
+print(paste("Predictors used:", paste(x_reg, collapse = ", ")))
+print(paste("Number of predictors:", length(x_reg)))
+
+# Split the data
+splits_reg <- h2o.splitFrame(data = df_h2o, ratios = 0.7, seed = 123)
+train_reg <- splits_reg[[1]]
+test_reg  <- splits_reg[[2]]
+
+# Check response variable distribution
+print("Response variable (log_pfoa) summary in training set:")
+print(h2o.summary(train_reg[, y_reg]))
+
+# Run AutoML 
+aml_reg <- h2o.automl(x = x_reg,
+                      y = y_reg,
+                      training_frame = train_reg,
+                      leaderboard_frame = test_reg,
+                      max_models = 20,
+                      seed = 1234)
+
+# Show leaderboard with all columns
+lb_reg <- h2o.get_leaderboard(aml_reg, extra_columns = "ALL")
+print(lb_reg, n = nrow(lb_reg))
+
+```
+
+
+```{r}
+# Best regression model
+best_model_reg <- aml_reg@leader
+print(best_model_reg)
+
+```
+
+
+```{r}
+# Get model performance on test set
+perf_test <- h2o.performance(best_model_reg, test_reg)
+print(perf_test)
+
+# Make predictions on test set
+predictions_reg <- h2o.predict(best_model_reg, test_reg)
+print(head(predictions_reg))
+
+```
+
+
+```{r}
+# Create a comparison of actual vs predicted values
+actual_vs_predicted <- h2o.cbind(test_reg[, y_reg], predictions_reg)
+colnames(actual_vs_predicted) <- c("actual_log_pfoa", "predicted_log_pfoa")
+print(head(actual_vs_predicted, 10))
+
+
+# Variable importance from the best model
+var_imp <- h2o.varimp(best_model_reg)
+print(head(var_imp, 10))
+
+```
+
+
+#AutoML for pfoa_detected (Binary Classification)
+```{r}
+# Load the h2o library
+library(h2o)
+
+# Start H2O 
+h2o.init()
+
+# Convert your dataframe to an H2OFrame
+df_h2o <- as.h2o(df)
+
+# Convert to factor (in the H2OFrame)
+df_h2o[, "pfoa_detected"] <- as.factor(df_h2o[, "pfoa_detected"])
+
+# Define response and predictors - REMOVING specified variables
+variables_to_remove <- c("latitude", "longitude", "tritium_category", "log_pfoa", "pfoa_val", "pfoa_detected")
+x_clf <- setdiff(names(df), variables_to_remove)
+y_clf <- "pfoa_detected"
+
+print(paste("Predictors used:", paste(x_clf, collapse = ", ")))
+print(paste("Number of predictors:", length(x_clf)))
+```
+
+
+```{r}
+# Split the data
+splits_clf <- h2o.splitFrame(data = df_h2o, ratios = 0.7, seed = 123)
+train_clf <- splits_clf[[1]]
+test_clf  <- splits_clf[[2]]
+
+# Check class distribution before balancing
+print(h2o.table(train_clf[, y_clf]))
+```
+
+
+```{r}
+# Run AutoML (Classification) with class balancing
+aml_clf <- h2o.automl(x = x_clf,
+                      y = y_clf,
+                      training_frame = train_clf,
+                      leaderboard_frame = test_clf,
+                      max_models = 20,
+                      seed = 1234,
+                      balance_classes = TRUE,  # Enable class balancing
+                      max_after_balance_size = 3.0)  
+
+# Show leaderboard with all columns
+lb_clf <- h2o.get_leaderboard(aml_clf, extra_columns = "ALL")
+print(lb_clf, n = nrow(lb_clf))
+```
+
+
+```{r}
+# Best classification model
+best_model_clf <- aml_clf@leader
+print(best_model_clf)
+```
+
+
+```{r}
+# Get model performance on test set
+perf_test <- h2o.performance(best_model_clf, test_clf)
+print(perf_test)
+
+```
+
+
+```{r}
+# Generate confusion matrix
+cm <- h2o.confusionMatrix(perf_test)
+print(cm)
+
+```
+
+
+```{r}
+# Make predictions on test set
+predictions_clf <- h2o.predict(best_model_clf, test_clf)
+print(head(predictions_clf))
+
+# Variable importance from the best model
+print("Variable Importance (Top 10):")
+var_imp <- h2o.varimp(best_model_clf)
+print(head(var_imp, 10))
+```
+
+
+```{r}
+# Create a proper confusion matrix using R's table function
+# Convert actual and predicted values to vectors
+actual <- as.vector(test_clf[, "pfoa_detected"])
+predicted <- as.vector(h2o.predict(best_model_clf, test_clf)$predict)
+
+# Convert to factors with the same levels
+actual <- factor(as.character(actual))
+predicted <- factor(as.character(predicted), levels = levels(actual))
+
+# Create confusion matrix
+print("Confusion Matrix:")
+conf_matrix <- table(Predicted = predicted, Actual = actual)
+print(conf_matrix)
+
+# Calculate metrics manually
+TP <- conf_matrix["1", "1"]
+TN <- conf_matrix["0", "0"]
+FP <- conf_matrix["1", "0"]
+FN <- conf_matrix["0", "1"]
+
+# Calculate all metrics
+total <- sum(conf_matrix)
+accuracy <- (TP + TN) / total
+sensitivity <- TP / (TP + FN)   # Recall or True Positive Rate
+specificity <- TN / (TN + FP)   # True Negative Rate
+precision <- TP / (TP + FP)     # Positive Predictive Value
+npv <- TN / (TN + FN)          # Negative Predictive Value
+f1_score <- 2 * (precision * sensitivity) / (precision + sensitivity)
+error_rate <- 1 - accuracy
+false_positive_rate <- FP / (FP + TN)
+false_negative_rate <- FN / (TP + FN)
+
+# Get AUC from H2O
+perf_test <- h2o.performance(best_model_clf, test_clf)
+auc_value <- h2o.auc(perf_test)
+
+# Print detailed metrics
+cat("\n=== DETAILED CLASSIFICATION METRICS ===\n")
+cat("True Positives (TP) :", TP, "\n")
+cat("True Negatives (TN) :", TN, "\n")
+cat("False Positives (FP):", FP, "\n")
+cat("False Negatives (FN):", FN, "\n")
+cat("Total Samples       :", total, "\n")
+
+cat("\n=== PERFORMANCE METRICS ===\n")
+cat("Accuracy            :", round(accuracy, 4), "\n")
+cat("Sensitivity (Recall):", round(sensitivity, 4), "\n")
+cat("Specificity         :", round(specificity, 4), "\n")
+cat("Precision (PPV)     :", round(precision, 4), "\n")
+cat("Negative Pred Value :", round(npv, 4), "\n")
+cat("F1 Score            :", round(f1_score, 4), "\n")
+cat("Error Rate          :", round(error_rate, 4), "\n")
+cat("False Positive Rate :", round(false_positive_rate, 4), "\n")
+cat("False Negative Rate :", round(false_negative_rate, 4), "\n")
+cat("AUC                 :", round(auc_value, 4), "\n")
+
+
+```
+
+
+```{r}
+# Summary table
+metrics_df <- data.frame(
+  Metric = c("Accuracy", "Sensitivity", "Specificity", "Precision", 
+             "NPV", "F1-Score", "Error Rate", "AUC"),
+  Value = c(round(accuracy, 4), round(sensitivity, 4), round(specificity, 4), 
+            round(precision, 4), round(npv, 4), round(f1_score, 4), 
+            round(error_rate, 4), round(auc_value, 4))
+)
+print(metrics_df)
+```
+
+
+
+
+
+
+

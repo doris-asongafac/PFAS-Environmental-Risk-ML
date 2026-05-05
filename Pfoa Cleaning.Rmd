@@ -1,0 +1,619 @@
+---
+title: "PFAS Project 2025"
+author: "Doris Mbitazi Asongafac"
+date: "2025-07-07"
+output: pdf_document
+---
+
+##PROJECT: Predicting PFOA Concentration in Groundwater Wells in 32 States in the US: A Machine Learning Approach Socioeconomically Assessment
+```{r}
+# Load required libraries
+library(janitor)      # For cleaning column names
+library(dplyr)        # For data manipulation
+library(lubridate)    # For date handling
+library(tidyr)
+library(forcats)
+
+```
+
+
+```{r}
+# DATA LOADING
+#Set working directory
+setwd("C:/Users/doris/Downloads/Praticum II/pfas project")
+
+#Load the data
+env <- read.csv("env.csv", stringsAsFactors = FALSE)
+wells <- read.csv("wells.csv", stringsAsFactors = FALSE)
+
+#Check the dimensions of the datasets
+cat("env dataset:", nrow(env), "rows,", ncol(env), "columns\n")
+cat("wells dataset:", nrow(wells), "rows,", ncol(wells), "columns\n")
+
+```
+```{r}
+# INITIAL DATA EXPLORATION AND QUALITY CHECKS
+
+# Check for missing values in original datasets
+cat("Missing values in original datasets:\n")
+cat(" env:", sum(is.na(env)), "missing values\n")
+cat(" wells:", sum(is.na(wells)), "missing values\n")
+
+
+#First we merge the environment and wells data
+# Find common variables for merging
+common_vars <- intersect(names(env), names(wells))
+cat("Common variables for merging:", paste(common_vars, collapse = ", "), "\n")
+
+# Check for duplicate WELL_IDs (important for data quality)
+cat("Duplicate WELL_IDs check:\n")
+cat("  - env duplicates:", sum(duplicated(env$WELL_ID)), "\n")
+cat("  - wells duplicates:", sum(duplicated(wells$WELL_ID)), "\n")
+```
+```{r}
+# DATA MERGING
+# Perform inner join to keep only wells with both environmental and well data
+merged_data <- merge(env, wells, by = "WELL_ID", all = FALSE)
+
+# Verify merge results
+cat("Merge results:\n")
+cat("  - Original env rows:", nrow(env), "\n")
+cat("  - Original wells rows:", nrow(wells), "\n")
+cat("  - Merged data rows:", nrow(merged_data), "\n")
+cat("  - Unique wells in merged data:", length(unique(merged_data$WELL_ID)), "\n")
+
+```
+```{r}
+# Clean column names (convert to lower_case, remove special characters)
+merged_data <- clean_names(merged_data)
+names(merged_data)
+```
+
+```{r}
+# Create binary response variable using the minimum laboratory limit(pfoa_lrl): 1 = detected, 0 = not detected
+merged_data$pfoa_detected <- ifelse(
+  merged_data$pfoa_val >= merged_data$pfoa_lrl, 1, 0
+)
+#Check missing data
+sum(is.na(merged_data))
+
+#See the structure
+str(merged_data)
+```
+
+```{r}
+#  HANDLE PLACEHOLDER VALUES
+# Replace common placeholder values with NA
+placeholder_values <- c("No data")
+for (placeholder in placeholder_values) {
+  merged_data[merged_data == placeholder] <- NA
+}
+
+```
+
+
+```{r}
+# FOCUSED COLUMN SELECTION FOR PFOA-ONLY ANALYSIS
+merged_data <- dplyr::select(
+  merged_data,
+  pfoa_val,             
+  pfoa_detected,
+  date,
+  state,
+  water_use,
+  tritium_tu,
+  well_depth,
+  tritium_category
+)
+
+cat("Selected", ncol(merged_data), "columns for PFOA-focused analysis\n")
+
+# structure of the merged_data
+str(merged_data)
+colSums(is.na(merged_data))
+```
+
+```{r}
+# DATA TYPE CONVERSIONS 
+library(lubridate)
+
+# Convert character date strings to Date format (MDY)
+merged_data$date <- mdy(merged_data$date)
+
+# Define numeric columns for conversion
+numeric_cols <- c(
+  "pfoa_val",          
+  "well_depth", 
+  "tritium_tu"
+)
+
+# Safe numeric conversion function
+safe_numeric_conversion <- function(x) {
+  x <- trimws(as.character(x))
+  x <- gsub("^<", "", x)
+  x <- gsub("^>", "", x)
+  suppressWarnings(as.numeric(x))
+}
+
+# Apply conversion 
+existing_numeric_cols <- numeric_cols[numeric_cols %in% names(merged_data)]
+merged_data[existing_numeric_cols] <- lapply(merged_data[existing_numeric_cols], safe_numeric_conversion)
+
+#Convert character columns to factors
+merged_data$pfoa_detected <- as.factor(merged_data$pfoa_detected)
+merged_data$state <- as.factor(merged_data$state)
+merged_data$water_use <- as.factor(merged_data$water_use)
+merged_data$tritium_category <- as.factor(merged_data$tritium_category)
+
+str(merged_data)
+```
+
+```{r}
+library(forcats)
+library(tidyr)
+
+# Replace NA in numeric columns with 0 and round to 2 decimal places
+merged_data <- merged_data %>%
+  mutate(across(where(is.numeric), ~ round(replace_na(., 0), 2)))
+
+# Replace NA in factor columns with "Unknown" only if any NA present
+factor_cols <- names(select(merged_data, where(is.factor)))
+for (col in factor_cols) {
+  if (any(is.na(merged_data[[col]]))) {
+    merged_data[[col]] <- fct_na_value_to_level(merged_data[[col]], level = "Unknown")
+  } else {
+    # Just to ensure it remains factor without adding "Unknown"
+    merged_data[[col]] <- factor(merged_data[[col]])
+  }
+}
+
+# Drop unused factor levels across all factor columns
+merged_data <- merged_data %>%
+  mutate(across(where(is.factor), droplevels))
+
+# Check structure after transformation
+colSums(is.na(merged_data))
+str(merged_data)
+
+```
+
+```{r}
+merged_data <- merged_data %>%
+  mutate(
+    year = lubridate::year(date),
+    month = lubridate::month(date, label = TRUE, abbr = FALSE)
+  ) %>%
+  select(-date)
+
+```
+
+
+```{r}
+#See the duration of the data
+unique_years <- sort(unique(merged_data$year))
+unique_years
+
+```
+
+##Getting predictors from the tidycensus data
+```{r}
+library(tidycensus)
+library(tidyverse)
+library(sf)
+library(tigris)
+library(purrr)
+library(dplyr)
+library(tidyr)
+#census_api_key("9e916ef9e7af077626cb6474fc37fd98accc4080")
+readRenviron("~/.Renviron")
+```
+
+
+```{r}
+library(gt)
+
+# Define years to collect
+years <- 2019:2022
+
+# Getting the necessary predictors at total level
+census_vars <- c(
+  total_pop = "B01003_001",           
+  total_pop_poverty = "B17001_001",   
+  median_income = "B19013_001",       
+  below_poverty = "B17001_002",       
+  unemployment = "B23025_005",        
+  total_labor = "B23025_002",         
+  white_pop = "B02001_002",           
+  black_pop = "B02001_003",           
+  hispanic_pop = "B03003_003",        
+  bachelor_degree = "B15003_022",     
+  master_degree = "B15003_023",
+  doctorate_degree = "B15003_025",
+  total_edu = "B15003_001",           
+  housing_units = "B25001_001",       
+  
+  # Age groups from B01001 (Sex by Age) - MALES
+  total_age_pop = "B01001_001",       # Total population for age calculations
+  male_under_5 = "B01001_003",        # Male under 5 years
+  male_5_9 = "B01001_004",            # Male 5 to 9 years  
+  male_10_14 = "B01001_005",          # Male 10 to 14 years
+  male_15_17 = "B01001_006",          # Male 15 to 17 years
+  male_18_19 = "B01001_007",          # Male 18 and 19 years
+  male_20 = "B01001_008",             # Male 20 years
+  male_21 = "B01001_009",             # Male 21 years
+  male_22_24 = "B01001_010",          # Male 22 to 24 years
+  male_25_29 = "B01001_011",          # Male 25 to 29 years
+  male_30_34 = "B01001_012",          # Male 30 to 34 years
+  male_35_39 = "B01001_013",          # Male 35 to 39 years
+  male_40_44 = "B01001_014",          # Male 40 to 44 years
+  male_45_49 = "B01001_015",          # Male 45 to 49 years
+  male_50_54 = "B01001_016",          # Male 50 to 54 years
+  male_55_59 = "B01001_017",          # Male 55 to 59 years
+  male_60_61 = "B01001_018",          # Male 60 and 61 years
+  male_62_64 = "B01001_019",          # Male 62 to 64 years
+  male_65_66 = "B01001_020",          # Male 65 and 66 years
+  male_67_69 = "B01001_021",          # Male 67 to 69 years
+  male_70_74 = "B01001_022",          # Male 70 to 74 years
+  male_75_79 = "B01001_023",          # Male 75 to 79 years
+  male_80_84 = "B01001_024",          # Male 80 to 84 years
+  male_85_over = "B01001_025",        # Male 85 years and over
+  
+  # Age groups from B01001 (Sex by Age) - FEMALES  
+  female_under_5 = "B01001_027",      # Female under 5 years
+  female_5_9 = "B01001_028",          # Female 5 to 9 years
+  female_10_14 = "B01001_029",        # Female 10 to 14 years
+  female_15_17 = "B01001_030",        # Female 15 to 17 years
+  female_18_19 = "B01001_031",        # Female 18 and 19 years
+  female_20 = "B01001_032",           # Female 20 years
+  female_21 = "B01001_033",           # Female 21 years
+  female_22_24 = "B01001_034",        # Female 22 to 24 years
+  female_25_29 = "B01001_035",        # Female 25 to 29 years
+  female_30_34 = "B01001_036",        # Female 30 to 34 years
+  female_35_39 = "B01001_037",        # Female 35 to 39 years
+  female_40_44 = "B01001_038",        # Female 40 to 44 years
+  female_45_49 = "B01001_039",        # Female 45 to 49 years
+  female_50_54 = "B01001_040",        # Female 50 to 54 years
+  female_55_59 = "B01001_041",        # Female 55 to 59 years
+  female_60_61 = "B01001_042",        # Female 60 and 61 years
+  female_62_64 = "B01001_043",        # Female 62 to 64 years
+  female_65_66 = "B01001_044",        # Female 65 and 66 years
+  female_67_69 = "B01001_045",        # Female 67 to 69 years
+  female_70_74 = "B01001_046",        # Female 70 to 74 years
+  female_75_79 = "B01001_047",        # Female 75 to 79 years
+  female_80_84 = "B01001_048",        # Female 80 to 84 years
+  female_85_over = "B01001_049"       # Female 85 years and over
+)
+
+# Function to get census data for a single year
+get_census_year <- function(year) {
+  get_acs(
+    geography = "state",
+    variables = census_vars,
+    year = year,
+    survey = "acs5",
+    geometry = FALSE
+  ) %>%
+    mutate(year = year)
+}
+
+# Get all the years
+census_data_list <- purrr::map(years, get_census_year)
+census_data_all <- bind_rows(census_data_list)
+
+# Get state geographic data with land area
+state_areas <- states(cb = TRUE, year = 2022) %>%
+  select(GEOID, NAME, ALAND) %>%
+  st_drop_geometry()
+
+# Reshaping the data and converting it into percentages
+census_data_processed <- census_data_all %>%
+  select(GEOID, NAME, variable, estimate, year) %>%
+  pivot_wider(names_from = variable, values_from = estimate) %>%
+  # Join with land area data
+  left_join(state_areas, by = c("GEOID", "NAME")) %>%
+  mutate(
+    # Calculate age groups (combining male + female for each age group)
+    children_pop = male_under_5 + female_under_5 + male_5_9 + female_5_9 + 
+                   male_10_14 + female_10_14 + male_15_17 + female_15_17,  # Under 18
+    
+    adults_pop = male_18_19 + female_18_19 + male_20 + female_20 + male_21 + female_21 + 
+                 male_22_24 + female_22_24 + male_25_29 + female_25_29 + 
+                 male_30_34 + female_30_34 + male_35_39 + female_35_39 + 
+                 male_40_44 + female_40_44 + male_45_49 + female_45_49 + 
+                 male_50_54 + female_50_54 + male_55_59 + female_55_59 + 
+                 male_60_61 + female_60_61 + male_62_64 + female_62_64,  # 18-64
+    
+    older_pop = male_65_66 + female_65_66 + male_67_69 + female_67_69 + 
+                male_70_74 + female_70_74 + male_75_79 + female_75_79 + 
+                male_80_84 + female_80_84 + male_85_over + female_85_over,  # 65+
+    
+    # Calculate percentages with 2 decimal places
+    poverty_rate = round((below_poverty / total_pop_poverty) * 100, 2),
+    unemployment_rate = round((unemployment / total_labor) * 100, 2),
+    pct_white = round((white_pop / total_pop) * 100, 2),
+    pct_black = round((black_pop / total_pop) * 100, 2),
+    pct_hispanic = round((hispanic_pop / total_pop) * 100, 2),
+    bachelor_plus_total = bachelor_degree + master_degree + doctorate_degree,
+    pct_bachelor_plus = round((bachelor_plus_total / total_edu) * 100, 2),
+    
+    # Age group percentages
+    pct_children = round((children_pop / total_age_pop) * 100, 2),
+    pct_adults = round((adults_pop / total_age_pop) * 100, 2),
+    pct_older = round((older_pop / total_age_pop) * 100, 2),
+    
+    # Convert land area from sq meters to sq miles and calculate density
+    land_area_sq_miles = ALAND / 2589988.110336,  # Convert to square miles
+    pop_density_per_sq_mile = round(total_pop / land_area_sq_miles, 2)
+  ) %>%
+  # Handle NA values that might occur in calculations
+  mutate(across(where(is.numeric), ~ifelse(is.na(.) | is.infinite(.), 0, .)))
+
+# Create a summary table for the most recent year (2022) using gt
+summary_table <- census_data_processed %>%
+  filter(year == 2022) %>%
+  select(NAME, total_pop, median_income, poverty_rate, unemployment_rate, 
+         pct_white, pct_black, pct_hispanic, pct_bachelor_plus, 
+         pct_children, pct_adults, pct_older, pop_density_per_sq_mile) %>%
+  arrange(desc(total_pop)) %>%
+  slice_head(n = 15) %>%  # Top 15 states
+  gt() %>%
+  tab_header(
+    title = "US State Demographics Summary (2022)"
+  ) %>%
+  cols_label(
+    NAME = "State",
+    total_pop = "Population",
+    median_income = "Median Income ($)",
+    poverty_rate = "Poverty Rate (%)",
+    unemployment_rate = "Unemployment (%)",
+    pct_white = "White (%)",
+    pct_black = "Black (%)",
+    pct_hispanic = "Hispanic (%)",
+    pct_bachelor_plus = "Bachelor+ (%)",
+    pct_children = "Under 18 (%)",
+    pct_adults = "18-64 (%)",
+    pct_older = "65+ (%)",
+    pop_density_per_sq_mile = "Pop. Density"
+  ) %>%
+  fmt_number(
+    columns = c(total_pop),
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_currency(
+    columns = c(median_income),
+    currency = "USD",
+    decimals = 0
+  ) %>%
+  fmt_number(
+    columns = c(poverty_rate, unemployment_rate, pct_white, pct_black, pct_hispanic, pct_bachelor_plus, pct_children, pct_adults, pct_older),
+    decimals = 2
+  ) %>%
+  fmt_number(
+    columns = c(pop_density_per_sq_mile),
+    decimals = 2
+  ) %>%
+  tab_style(
+    style = list(
+      cell_text(weight = "bold")
+    ),
+    locations = cells_column_labels()
+  ) %>%
+  tab_footnote(
+    footnote = "Data source: US Census Bureau, American Community Survey 5-Year Estimates",
+    locations = cells_title()
+  ) %>%
+  opt_row_striping() %>%
+  opt_table_font(font = "system-ui") %>%
+  tab_options(
+    table.font.size = px(12),
+    heading.title.font.size = px(16),
+    column_labels.font.weight = "bold",
+    table.border.top.style = "hidden",
+    table.border.bottom.style = "hidden"
+  )
+
+# Display the table
+summary_table
+```
+
+
+```{r}
+# Keep only selected predictors in the existing dataset as predictors we want to work with
+census_data_processed <- census_data_processed %>%
+  select(
+    GEOID, NAME, year,
+    total_pop,
+    median_income,
+    poverty_rate,
+    unemployment_rate,
+    pct_white,
+    pct_black,
+    pct_hispanic,
+    pct_bachelor_plus,
+    pct_children,
+    pct_adults,
+    pct_older,
+    pop_density_per_sq_mile
+  )
+head(census_data_processed)
+
+#Check dimensions
+dim(census_data_processed)
+#Check missing values
+sum(is.na(census_data_processed))
+
+```
+
+
+```{r}
+#Now to merge the census data with  merged_data
+census_data_processed <- census_data_processed %>%
+  rename(state = NAME)
+# Find common variables for merging
+common <- intersect(names(census_data_processed), names(merged_data))
+common
+full_merged <- merge(census_data_processed, merged_data, by = c("state", "year"), all = TRUE)
+head(full_merged)
+dim(full_merged)
+```
+
+
+```{r}
+#Next getting laitudes and longitudes
+# Load necessary libraries
+library(dplyr)
+library(sf)     
+library(tigris) 
+
+us_states_sf <- tigris::states(year = 2022, cb = TRUE) 
+us_states_sf <- us_states_sf %>%
+  filter(LSAD == "00") %>% 
+  select(STATEFP, NAME)
+
+# 2. Calculate the centroid (approximate center) for each state
+state_centroids <- us_states_sf %>%
+  st_centroid() %>%
+  st_coordinates() %>% # Extracts X (longitude) and Y (latitude) coordinates
+  as.data.frame() %>%
+  rename(state_longitude = X, state_latitude = Y) %>%
+  bind_cols(us_states_sf %>% select(NAME)) # Add state name back for joining
+
+# 3. Join these centroids to our main  dataset
+# Ensure the 'state' column in your 'df' matches the 'NAME' column in state_centroids (e.g., "Alabama", "California")
+df_with_coords <-  full_merged %>%
+   left_join(state_centroids, by = c("state" = "NAME"))
+# Inspect the result
+sum(is.na(df_with_coords))
+dim(df_with_coords)
+head(df_with_coords)
+
+```
+```{r}
+#Next we finalise our groundwater well, environmental and socioeconomic 
+#data by removing unnecessary columns and renaming our dataset
+library(dplyr)
+
+final_data <- df_with_coords %>%
+  select(-GEOID, -geometry) %>%            # Remove unwanted columns
+  rename(longitude = state_longitude,      # Rename coordinates
+         latitude = state_latitude) %>%
+# Reorder columns: putting pfoa_val and pfoa_detected first, then everything else 
+select(pfoa_val, pfoa_detected, everything())
+
+#Check the completeness
+sum(is.na(final_data))
+
+# Check the structure of the new dataset
+str(final_data)
+
+# Display first few rows to verify
+head(final_data)
+
+
+
+```
+
+```{r}
+# Loading the cancer dataset
+cancer <- read.csv("Cancer_rates_across_states_data_only-2.csv", stringsAsFactors = FALSE)
+
+#Clean the column names
+cancer <- clean_names(cancer)
+
+#check missing values
+sum(is.na(cancer))
+# Check the original data type
+str(cancer)
+```
+```{r}
+# Check the merge key
+common <- intersect(names(final_data), names(cancer))
+print(common) 
+cancer <- cancer %>% filter(state != "US")
+
+```
+
+```{r}
+# Perform the merge
+merged <- left_join(final_data, cancer, by = "state")
+
+# Check the result
+sum(is.na(merged))
+str(merged)
+```
+
+
+```{r}
+merged_subset <- merged %>%
+  select(
+    pfoa_val,
+    pfoa_detected,
+    state,
+    water_use,
+    tritium_tu,
+    well_depth,
+    tritium_category,
+    month,
+    median_income,
+    total_pop,
+    poverty_rate,
+    unemployment_rate,
+    pct_white,
+    pct_black,
+    pct_hispanic,
+    pct_bachelor_plus,
+    pct_children,
+    pct_adults,
+    pct_older,
+    pop_density_per_sq_mile,
+    longitude,
+    latitude,
+    average_annual_count
+  )
+str(merged_subset)
+```
+```{r}
+#Convert incorrect classes
+merged_subset$average_annual_count <- as.numeric(merged_subset$average_annual_count)
+
+str(merged_subset)
+
+```
+
+
+```{r}
+# Step 1: Compute the mean (excluding NAs)
+mean_val <- mean(merged_subset$average_annual_count, na.rm = TRUE)
+
+# Step 2: Impute Indiana's missing values with the mean
+merged_subset$average_annual_count[merged_subset$state == "Indiana"] <- mean_val
+
+# Step 3: Convert entire column to percentage of total
+merged_subset$cancer_rate <- round(
+  (merged_subset$average_annual_count / merged_subset$total_pop) * 100,
+  2
+)
+
+
+colSums(is.na(merged_subset))
+str(merged_subset)
+```
+```{r}
+merged_subset_clean <- na.omit(merged_subset)
+colSums(is.na(merged_subset_clean))
+dim(merged_subset_clean)
+```
+```{r}
+# Remove total_pop and average_annual_count columns
+final <- merged_subset_clean[, !(names(merged_subset_clean) %in% c("total_pop", "average_annual_count"))]
+
+str(final)
+```
+
+
+```{r}
+write.csv(final, "final_data_clean.csv", row.names = FALSE)
+```
+
+
